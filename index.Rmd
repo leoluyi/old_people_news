@@ -10,10 +10,8 @@ output:
     toc_depth: 2
 ---
 
-```{r setup, include=TRUE}
-knitr::opts_chunk$set(
-  warning = FALSE
-)
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, echo = FALSE)
 ```
 
 
@@ -163,8 +161,8 @@ cutter <- function (text, worker) {
 
 
 First take a glimpse:
-```{r}
-raw_data %>% head
+```{r glimpse}
+raw_data %>% head %>% DT::datatable(extensions = "Responsive")
 ```
 
 ### 關鍵詞 Top 100
