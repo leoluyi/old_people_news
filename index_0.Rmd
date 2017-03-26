@@ -1,0 +1,374 @@
+---
+title: "銀髮新聞"
+author: "LU YI<br/>(#2363)"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+    toc: yes
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE)
+library(RSQLServer)
+library(DBI)
+library(magrittr)
+library(data.table)
+library(dplyr)
+library(dtplyr)
+library(readr)
+library(stringr)
+library(tm)
+library(text2vec)
+library(jiebaR) # word segmentation
+library(wordcloud) # word cloud
+library(topicmodels)
+library(ggplot2)
+# http://stackoverflow.com/questions/25759007/error-installing-topicmodels-package-non-zero-exit-status-ubuntu
+library(igraph)
+library(DT)
+source("utils/smp.r", encoding = "UTF-8")
+```
+
+## 項目說明
+
+從近期的新聞資料中尋找銀髮退休理財議題相關的討論和話題
+
+## Data Source
+
+```{r data, include=FALSE, cache=TRUE}
+con <- dbConnect(RSQLServer::SQLServer(), # jTDS driver 
+                 "TSDB_MSSQL-connection", 
+                 database = 'TSDB_MSSQL')
+res <- dbSendQuery(con, "SELECT news_url, news_source, title,
+                               datetime, news_text
+                        FROM NEWS_APPLEDAILY")
+raw_data <-dbFetch(res) %>% data.table
+raw_data[, datetime := datetime %>% as.Date] %>% invisible()
+```
+
+```{r, include=FALSE}
+## data cleansing
+keyword <- "老(人|化|年)|高齡|銀髮|養老|樂齡|保健|遺產|長照|勞退"
+news_text <- raw_data[str_detect(news_text, keyword), news_text]
+```
+
+### 老年相關關鍵字
+
+所擷取新聞是從以下關鍵字中搜尋
+
+```{r}
+readLines("data/news_keyword.txt")
+```
+
+### 新聞頻道來源
+
+- 資料量
+
+從蘋果日報網站抓取近一年來的關鍵字新聞，共 `r nrow(raw_data)` 篇
+
+- 新聞期間
+
+```{r}
+raw_data[, datetime] %>% range
+```
+
+
+
+
+## 內文分析
+
+```{r tm functions, include=FALSE}
+## 起手式，結巴建立斷詞器
+mix_seg <- worker(type = "mix",
+                  user = "./utils/dict.txt.utf8.txt",symbol = FALSE,
+                  encoding = "UTF-8")
+hmm_seg <- worker(type = "hmm",
+                  user = "./utils/dict.txt.utf8.txt",symbol = FALSE,
+                  encoding = "UTF-8")
+# mix_seg <= post_text[1] # try first post
+
+# self-made filter (built-in perl's regular expression has bug)
+cutter <- function (msg) {
+  filter_words = c("食(品)?安(全)?","食品",
+                   "英文$","年\\n","媒\\n",
+                   "我.?","他.?","你.?",
+                   "所以","可以","沒有","不過","因為",
+                   "還是","覺得","大家","比較","感覺","時候","現在","時間",
+                   "可能","東西","然後","而且","自己","有點",
+                   "這邊","那.","發現","雖然","不要","還是",
+                   "一樣","知道","看到","真的","今天","就是","這樣","如果",
+                   "不會","什麼","後來","問題","之前","只是","或是","的話",
+                   "其他","這麼","已經","很多","出來","整個","但是","卻",
+                   "偏偏","如果","不過","因此","或","又","也","其實",
+                   "希望","結果","怎麼","當然","有些","以上","另外","此外",
+                   "以外","裡面","部分","直接","剛好","由於",
+                   "原本","標題","時間","日期","作者","這種","表示","看見",
+                   "似乎","一半","一堆","反正","常常","幾個","目前","上次",
+                   "公告","只好","哪裡","一.","怎麼","好像","結果",
+                   "而已", "居然", "謝謝",
+                   "po","xd","應該","最後","有沒有","sent","from","my",
+                   "Android", "JPTT",
+                   "請問","謝謝","台灣","有人",
+                   "還.","各位","報導","這.","ntd","提供","最.","不是",
+                   "記者",
+                   "中心","之.","指出","朋友",
+                   "了","也","的","在","與","及","等","是","the","and",
+                   "in","a","at","he","is","of","He","b")
+  pattern <- sprintf("^%s", paste(filter_words, collapse = "|^"))
+  filter_seg <- grep(pattern, mix_seg <= msg ,value=TRUE, invert = TRUE)
+  return(filter_seg)
+}
+```
+
+
+First take a glimpse:
+```{r}
+news_text %>% head
+```
+
+### 詞頻
+
+```{r, include=FALSE}
+## vectorize
+segRes <- lapply(news_text, cutter)
+tmWordsVec <- sapply(segRes, function(ws) paste(ws,collapse = " "))
+# tmWordsVec[2]
+## build courpus
+myCorpus <- Corpus(VectorSource(tmWordsVec)) # build a corpus
+myCorpus <- tm_map(myCorpus, stripWhitespace) # remove extra whitespace
+
+## build tdm
+tdm <- TermDocumentMatrix(myCorpus,
+                          control = list(wordLengths = c(2, Inf)))
+tdm
+```
+
+```{r, include=FALSE}
+## 看看一下詞頻分的如何 (因為看到分的不好才弄個過濾器的)
+dtm1 <- DocumentTermMatrix(myCorpus,
+                           control = list(
+                             wordLengths=c(2, Inf), # to allow long words
+                             removeNumbers = FALSE, ## if TRUE would remove 7-11
+                             weighting = weightTf,
+                             encoding = "UTF-8"
+                           ))
+removeSparseTerms(dtm1, .99)
+dtm1 <- dtm1[, !grepl("^\\d+$", dtm1$dimnames$Terms)] ## remove numbers
+# colnames(dtm1)
+# findFreqTerms(dtm1, 30) # 看一下高频詞, he沒法filter掉
+```
+
+詞頻高於 30 的詞
+
+```{r, echo=FALSE}
+# http://stackoverflow.com/questions/14426925/frequency-per-term-r-tm-documenttermmatrix
+terms <- findFreqTerms(tdm, lowfreq = 30)
+tdm[terms,] %>%
+  as.matrix() %>%
+  rowSums() %>% 
+  data.frame(Term = terms, Frequency = .) %>%  
+  arrange(desc(Frequency))
+```
+
+### Wordcloud
+
+```{r, message=FALSE, warning=FALSE, out.width=1200}
+m <- as.matrix(dtm1)
+# head(m)
+
+## wordcloud
+v <- sort(colSums(m[,!colnames(m) %in% c("超商")]), decreasing=TRUE)
+myNames <- names(v)
+d <- data.frame(word=myNames, freq=v)
+# plot
+pal2 <- brewer.pal(8,"Dark2")
+# png(paste(getwd(), "/pic/wordcloud100_2",  ".png", sep = ''),
+#     width=10, height=10, units="in", res=700)
+# par(family='STHeiti')
+wordcloud(d$word, d$freq,
+          scale=c(3,0.5),
+          min.freq=median(d$freq, na.rm = TRUE),
+          max.words=100,
+          random.order=FALSE,
+          rot.per=.01,
+          colors=pal2)
+# dev.off()
+```
+
+
+## Topic Models
+
+### 主題整理
+
+- 老年年金給付：衛福部修法，補繳國民年金的利息將可從給付中直接扣除
+- 以房養老：丁克華要金融業　多推高齡化產品
+- 軍公教財富
+- 長照需求：日本失智之家、長照保險
+- 年金改革性別差異：女性平均薪資僅有男性的8成左右
+- 單身族：需負起奉養雙親責任，未能安心享有老年經濟安全的保障
+- 花旗：金融業資金可導入長照
+- 三商美邦人壽：三明治族、銀髮族保險、團體年金保險
+- 富邦人壽：健檢、實物給付保單
+
+
+
+```{r topic model, eval=FALSE, include=FALSE}
+## 利用 tf-idf 來處理高頻詞高估，低頻詞低估
+dtm <- dtm1
+term_tfidf <-tapply(dtm$v/row_sums(dtm)[dtm$i],
+                    dtm$j,
+                    mean) * log2(nDocs(dtm)/col_sums(dtm > 0))
+l1 <- term_tfidf >= quantile(term_tfidf, 0.5) # second quantile, ie. median
+summary(col_sums(dtm))
+# dim(dtm)
+dtm <- dtm[,l1]
+dtm <- dtm[row_sums(dtm) > 0, ]
+# dim(dtm)
+summary(col_sums(dtm))
+
+
+## smp
+fold_num = 10
+kv_num = seq(10, 30, 2)
+seed_num = 2016
+try_num = 3
+
+sp <- smp(cross = 5, n = dtm$nrow, seed = seed_num) # n = nrow(dtm)
+system.time({
+  (ctmK <- selectK(dtm = dtm,
+                   kv = kv_num,
+                   SEED=seed_num,
+                   cross = fold_num,
+                   sp = sp,
+                   try_num = try_num))
+})
+
+# 跑個模擬，挑一個好的主題數
+k <- c(kv_num)
+# perplex = ctmK[[1]]  # perplexity matrix
+logLik = ctmK[[2]]  # loglik
+
+# matplot(k, df, type = c("b"), xlab = "Number of topics",
+#         ylab = "Perplexity", pch=1:try_num,col = 1, main = '')
+# legend("topright", legend = paste("fold", 1:try_num), col=1, pch=1:try_num)
+matplot(k, logLik, type = c("b"), 
+        xlab = "Number of topics",
+        ylab = "Log-Likelihood", 
+        pch=1:try_num, col = 1, main = '')
+legend("topleft", 
+       legend = paste("fold", 1:try_num), 
+       col=1, pch=1:try_num)
+```
+
+
+```{r, include=FALSE}
+## 現成有四種調法
+# n_topic <- which(logLik == max(logLik))+1
+n_topic <- 15
+n_word <- 15 # 要的文字數
+```
+
+```{r, eval=FALSE, include=FALSE}
+SEED <- 2016
+jss_TM2 <- list(
+  VEM = LDA(dtm, k = n_topic, control = list(seed = SEED)),
+  VEM_fixed = LDA(dtm, k = n_topic,
+                  control = list(estimate.alpha = FALSE, seed = SEED)),
+  Gibbs = LDA(dtm, k = n_topic, method = "Gibbs",
+              control = list(seed = SEED, burnin = 1000, thin = 100, iter = 1000)),
+  CTM = CTM(dtm, k = n_topic,
+            control = list(seed = SEED, var = list(tol = 10^-4),
+                           em = list(tol = 10^-3)))
+)
+
+
+# terms(模型, 要的文字數)
+termsForSave1 <- terms(jss_TM2[["VEM"]], n_word)
+termsForSave2 <- terms(jss_TM2[["VEM_fixed"]], n_word)
+termsForSave3 <- terms(jss_TM2[["Gibbs"]], n_word)
+termsForSave4 <- terms(jss_TM2[["CTM"]], n_word)
+
+l <- mget(c("termsForSave1", "termsForSave2", "termsForSave3", "termsForSave4"))
+
+## save terms
+dir.create("output", showWarnings = F, recursive = T)
+dir.create("data", showWarnings = F, recursive = T)
+mapply(
+  function(x, path) {
+    as.data.frame(x, stringAsFactor=FALSE) %>%
+      readr::write_csv(., path)
+    invisible()
+  },
+  path=sprintf("output/%s.txt", names(l)),
+  x=l
+)
+
+tfs <- as.data.frame(termsForSave3, stringsAsFactors = F)
+save(tfs, file="./data/tfs.RData")
+```
+
+Topic Models igraph
+
+```{r topicmodel plot, echo=FALSE, out.width=1024}
+## plot
+load("./data/tfs.RData")
+adjacent_list <- lapply(1:n_topic, function(i) embed(tfs[,i], 2)[, 2:1])
+edgelist <- as.data.frame(do.call(rbind, adjacent_list), stringsAsFactors =F)
+topic <- unlist(lapply(1:n_topic, function(i) rep(i, n_word-1)))
+edgelist$topic <- topic
+g <- igraph::graph.data.frame(edgelist,directed=T)
+l <- igraph::layout.fruchterman.reingold(g)
+# edge.color="black"
+nodesize <- centralization.degree(g)$res
+V(g)$size <- log(centralization.degree(g)$res)
+nodeLabel <- V(g)$name
+E(g)$color <-  unlist(lapply(sample(colors()[26:137], 10),
+                             function(i) rep(i, 9)))
+# unique(E(g)$color)
+# save(g, nodeLabel,l, file="./data/igraph_data.RData")
+# load("./data/igraph_data.RData")
+
+## output
+# library(Cairo)
+# CairoPNG("./result/topicmodel_graph_gibbs.png",
+#          width=1024,
+#          height=720)
+# igraph_options(label.family='')
+plot(g,
+     vertex.label = nodeLabel,
+     edge.curved = TRUE,
+     vertex.label.cex = 0.8,
+     vertex.label.color="gray48",
+     edge.arrow.size = 0.2,
+     layout=l)
+# dev.off()
+```
+
+Topics
+
+```{r}
+DT::datatable(tfs, options = list(pageLength = 15))
+```
+
+Quick View
+
+```{r}
+raw_data %>% 
+  data.table() %>%
+  .[str_detect(news_text, keyword), 
+    .(title = sprintf("<a href='%s' target='_blank'>%s</a>",
+                      news_url, title), 
+        datetime,
+        news_text)] %>% 
+  DT::datatable(escape = FALSE)
+```
+
+
+<!-- ## Cloud Report -->
+
+<!-- <a href="&#9; goo.gl/W1JYLQ"><img src="https://chart.googleapis.com/chart?cht=qr&amp;chl=%09+goo.gl%2FW1JYLQ&amp;chld=L|0&amp;chs=320" border="0"></a> -->
+

@@ -1,0 +1,403 @@
+---
+title: "銀髮新聞"
+author: "LU YI"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+    toc: yes
+    toc_depth: 2
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(
+  warning = FALSE
+)
+```
+
+
+```{r, cache=FALSE, include=FALSE}
+library(magrittr)
+library(data.table)
+library(dplyr)
+library(dtplyr)
+library(readr)
+library(stringr)
+library(tm) # install.packages("slam", type = "binary")
+library(text2vec)
+library(jiebaR) # word segmentation
+library(wordcloud2)
+# library(topicmodels)
+# http://stackoverflow.com/questions/24172188/how-can-i-install-topicmodels-package-in-r
+library(ldatuning) # Select number of topics for LDA model # sudo apt install libmpfr-dev
+library(lda)
+library(wordVectors) # devtools::install_github("bmschmidt/wordVectors")
+library(ggplot2)
+library(feather)
+library(DT)
+library(corrr) # for corr plot
+library(Matrix) # for Sparse Matrix
+library(slam)
+library(lubridate)
+library(viridis)
+invisible(
+  lapply(list.files("utils", pattern = "\\.[Rr]$", full.names = TRUE), 
+         function(x) {source(x, encoding = "UTF-8"); invisible()})
+)
+# devtools::install_github("qinwf/ropencc") # 繁簡轉換
+```
+
+## 項目說明
+
+從近期的新聞資料中尋找銀髮退休理財議題相關的討論和話題
+
+## Data Source
+
+```{r data, include=FALSE, cache=TRUE}
+# con <- dbConnect(RSQLServer::SQLServer(), # jTDS driver 
+#                  "TSDB_MSSQL-connection", 
+#                  database = 'TSDB_MSSQL')
+# res <- dbSendQuery(con, "SELECT news_url, news_source, title,
+#                                datetime, news_text
+#                         FROM NEWS_APPLEDAILY")
+# raw_data <-dbFetch(res) %>% data.table
+raw_data <- fread("data/old_people_news_data.csv")
+raw_data[, datetime := datetime %>% as.Date] %>% invisible()
+```
+
+```{r, include=FALSE}
+## data cleansing
+keyword <- "老(人|化|年)|高齡|銀髮|養老|樂齡|保健|遺產|長照|勞退"
+raw_data <- raw_data[!str_detect(keywords, "即時新聞|娛樂|副刊|暖流")]
+raw_data <- raw_data[!str_detect(news_text, "廣編")]
+raw_data <- raw_data[str_detect(news_text, keyword)]
+
+# remove url
+url_re <- "((([A-Za-z]{3,9}:(?:\\/\\/)?)(?:[\\-;:&=\\+\\$,\\w]+@)?[A-Za-z0-9\\.\\-]+|(?:www\\.|[\\-;:&=\\+\\$,\\w]+@)[A-Za-z0-9\\.\\-]+)((?:\\/[\\+~%\\/\\.\\w\\-_]*)?\\??(?:[\\-\\+=&;%@\\.\\w_]*)#?(?:[\\.\\!\\/\\\\\\w]*))?)"
+raw_data[, news_text := news_text %>% str_replace_all(url_re, "")]
+
+# raw_data %>% View
+```
+
+### 「老年」相關關鍵字
+
+所擷取新聞是從以下關鍵字中搜尋
+
+```{r}
+"老年"
+```
+
+### 新聞頻道來源
+
+- 資料量
+
+從蘋果日報網站抓取近一年來的關鍵字新聞，共 `r nrow(raw_data)` 篇
+
+- 新聞期間
+
+```{r}
+raw_data[, datetime] %>% range
+```
+
+
+## 內文分析
+
+```{r tm functions, include=FALSE}
+## 起手式，結巴建立斷詞器
+mix_seg <- worker(type = "mix",
+                  user = "utils/user_dict_utf8.txt",
+                  stop_word = "utils/stop_utf8.txt",
+                  symbol = FALSE,
+                  encoding = "UTF-8")
+# hmm_seg <- worker(type = "hmm",
+#                   user = "utils/user_dict_utf8.txt",
+#                   stop_word = "utils/stop_utf8.txt",
+#                   symbol = FALSE,
+#                   encoding = "UTF-8")
+
+# self-made filter (built-in perl's regular expression has bug)
+cutter <- function (text, worker) {
+  # text = "馬英九去世新大學演講"
+  if (text %in% c(".", "")) {
+    return(NA_character_)
+  }
+  
+  filter_words = c(
+    "推文", "站內信", "其他", "推",
+    "我.?","他.?","你.?", "想說", "本報記者",
+    "所以","可以","沒有","不過","因為",
+    "還是","覺得","大家","比較","感覺","時候","現在","時間",
+    "可能","東西","然後","而且","自己","有點",
+    "這邊","那.","發現","雖然","不要","還是",
+    "一樣","知道","看到","真的","今天","就是","這樣","如果",
+    "不會","什麼","後來","問題","之前","只是","或是","的話",
+    "其他","這麼","已經","很多","出來","整個","但是","卻",
+    "偏偏","如果","不過","因此","或","又","也","其實",
+    "希望","結果","怎麼","當然","有些","以上","另外","此外",
+    "以外","裡面","部分","直接","剛好","由於",
+    "原本","標題","時間","日期","作者","這種","表示","看見",
+    "似乎","一半","一堆","反正","常常","幾個","目前","上次",
+    "公告","只好","哪裡","一.","怎麼","好像","結果",
+    "而已", "居然", "謝謝","請問","大大","小弟", "文章代碼",
+    "po","xd","應該","最後","有沒有","sent","from","my",
+    "Android", "JPTT", "如提","如題","編輯","引述","銘言","站內信",
+    "記者",
+    "中心","之.","指出","朋友",
+    "了","也","的","在","與","及","等","是","the","and",
+    "月", "年", "日", "時", "NA",
+    "\\s",
+    "[a-zA-Z]",
+    "[0-9]"
+  )
+  pattern <- sprintf("^%s", paste(filter_words, collapse = "|^"))
+  tryCatch({
+    text_seg <- mix_seg <= text
+  }, error = function(e) {
+    stop('"', text, '" >> ', e)
+  })
+  filter_seg <- text_seg[!stringr::str_detect(text_seg, pattern)]
+  filter_seg
+}
+```
+
+
+First take a glimpse:
+```{r}
+raw_data %>% head
+```
+
+### 關鍵詞 Top 100
+
+利用 tf-idf 關鍵詞算法，處理高頻詞高估及低頻詞低估的問題，取得整個文檔的關鍵詞
+
+
+```{r, include=FALSE}
+# segment
+library(parallel)
+cl <- makeCluster(detectCores()-1)
+clusterEvalQ(cl, {
+  library(stringr)
+  library(jiebaR)
+  mix_seg <- worker(type = "mix",
+                  user = "utils/user_dict_utf8.txt",
+                  stop_word = "utils/stop_utf8.txt",
+                  symbol = FALSE,
+                  encoding = "UTF-8")
+})
+clusterExport(cl, list("cutter"))
+
+text_seg <- raw_data[, news_text] %>% 
+  parLapply(cl, ., cutter) %>% 
+  parLapply(cl, ., function(x) x[!is.na(x)])
+stopCluster(cl)
+# adjust to the format for text2vec::itoken
+text_token <- itoken(text_seg)
+```
+
+
+```{r, include=FALSE}
+# unique word matrix
+vocab <- create_vocabulary(text_token, ngram=c(1L, 2L), sep_ngram = "")
+# dtm
+vectorizer <- vocab_vectorizer(vocab)
+dtm <- create_dtm(text_token, vectorizer)
+# remove 1-word term
+dtm <- dtm[, dtm %>% colnames() %>% nchar >= 2]
+
+# dtm %>% find_freq_terms(30) # not good
+
+## tf-idf
+# define tfidf model
+tfidf = TfIdf$new()
+# fit model to train data and transform train data with fitted model
+dtm_train_tfidf = fit_transform(dtm, tfidf)
+# tfidf modified by fit_transform() call!
+```
+
+```{r}
+key_term <- dtm_train_tfidf %>% 
+  find_freq_terms(lowfreq = 0.05) %>% 
+  colSums() %>% 
+  data.frame() %>% 
+  data.table(keep.rownames = TRUE) %>% 
+  setnames(c("keyword", "sum_tf_idf")) %>% 
+  .[order(-sum_tf_idf)]
+key_term %>% head(100) %>% DT::datatable(extensions = "Responsive")
+```
+
+
+- Wordcloud
+
+```{r}
+d <- key_term %>% head(200)
+ncolor <- nrow(d)
+getPalette = colorRampPalette(RColorBrewer::brewer.pal(8, "Set2"))
+wordcloud2(d, 
+           size = 0.5,
+           fontFamily = "Noto Sans CJK TC", 
+           fontWeight = "normal",
+           rotateRatio = 0,
+           color = getPalette(ncolor),
+           shape = "circle")
+```
+
+
+## Topic Models
+
+### 主題整理
+
+- 老年年金給付：衛福部修法，補繳國民年金的利息將可從給付中直接扣除
+- 以房養老：丁克華要金融業　多推高齡化產品
+- 軍公教財富
+- 長照需求：日本失智之家、長照保險
+- 年金改革性別差異：女性平均薪資僅有男性的8成左右
+- 單身族：需負起奉養雙親責任，未能安心享有老年經濟安全的保障
+- 花旗：金融業資金可導入長照
+- 三商美邦人壽：三明治族、銀髮族保險、團體年金保險
+- 富邦人壽：健檢、實物給付保單
+
+
+```{r, eval=FALSE}
+# Preprocessing ------------------------------------------------
+# https://cran.r-project.org/web/packages/text2vec/vignettes/text-vectorization.html
+doc.list <- text_seg
+
+## tf-idf
+# define tfidf model
+tfidf = TfIdf$new()
+# fit model to train data and transform train data with fitted model
+dtm_train_tfidf = fit_transform(dtm, tfidf)
+# tfidf modified by fit_transform() call!
+
+l1 <- dtm_train_tfidf %>% find_freq_terms(lowfreq = 5) %>%
+  colSums() %>% median()
+l1_terms <- (dtm_train_tfidf %>% find_freq_terms(lowfreq = 5) %>%
+  colSums() > l1) %>% names
+
+# compute the table of terms:
+# term.table <- dtm %>% slam::col_sums()
+# term.table <- sort(term.table, decreasing = TRUE)
+
+# remove terms that are stop words or occur fewer than 5 times:
+term.table <- setNames(vocab$vocab$terms_counts, vocab$vocab$terms)
+del_1 <- term.table < 5
+del_2 <- names(term.table) %>% nchar < 2
+term.table <- term.table[!del_1 & !del_2]
+vocab_ <- names(term.table)
+
+get_terms <- function(doc.list, vocab) {
+  index <- match(doc.list, vocab)
+  index <- index[!is.na(index)]
+  rbind(as.integer(index - 1), as.integer(rep(1, length(index))))
+}
+documents <- mclapply(doc.list, get_terms, vocab=vocab_, mc.cores = 3)
+
+# Compute some statistics related to the data set:
+D <- length(documents)  # number of documents (2,000)
+W <- length(vocab_)  # number of terms in the vocab (14,568)
+doc.length <- sapply(documents, function(x) sum(x[2, ]))  # number of tokens per document [312, 288, 170, 436, 291, ...]
+N <- sum(doc.length)  # total number of tokens in the data (546,827)
+term.frequency <- as.integer(term.table)  # frequencies of terms in the corpus
+```
+
+```{r, eval=FALSE}
+# 跑個模擬，挑一個好的主題數 -----------------------------------
+
+dtm <- doc.list %>% seglist_to_dtm %>% filter_tfidf_dtm(q = .5)
+
+# https://cran.r-project.org/web/packages/ldatuning/vignettes/topics.html
+tic <- Sys.time()
+result <- FindTopicsNumber(
+  dtm,
+  topics = c(seq(2, 6, by = 2),
+             seq(10, 60, by = 5),
+             seq(60, 100, by = 10)#,
+             #seq(120, 200, by = 20)
+             ),
+  metrics = c("Griffiths2004", "CaoJuan2009", "Arun2010"),
+  method = "Gibbs",
+  control = list(seed = Sys.time() %>% as.numeric()),
+  mc.cores = 3L,
+  verbose = TRUE
+)
+Sys.time() - tic # Time difference of 6.425704 hours
+save(result, file = "models/lda_sim_result.RData")
+# load("models/lda_sim_result_all.RData")
+FindTopicsNumber_plot(result)
+```
+
+
+```{r, eval=FALSE}
+# Topic Model ----------------------------------
+
+# vocab_temp <- dtm_train_tfidf %>% filter_tfidf_dtm() %>% colnames()
+# term.table <- vocab_tbl$vocab %>% 
+#   data.table() %>% 
+#   .[terms %in% vocab_temp && terms >= 2]
+# term.frequency <- term.table[, terms_counts]
+# vocab <- term.table[, terms]
+
+# MCMC and model tuning parameters:
+K <- 35  # n_topic
+G <- 4000 # num.iterations (about N^2, N = words in a doc)
+alpha <- 0.02
+eta <- 0.02
+
+# Fit the model:
+set.seed(2016)
+t1 <- Sys.time()
+lda_fit <- lda.collapsed.gibbs.sampler(
+  documents = documents, K = K, vocab = vocab_, 
+  num.iterations = G, alpha = alpha, 
+  eta = eta, initial = NULL, burnin = 0,
+  compute.log.likelihood = TRUE)
+t2 <- Sys.time()
+t2 - t1  # Time difference of 2.72283 mins
+
+# Save Result
+save(lda_fit, file = "./models/lda_fit.RData")
+```
+
+
+根據指標選擇 35 個 topic cluster
+
+**Result**
+
+```{r lda result, cache=FALSE}
+library(lda)
+load("./models/lda_fit.RData")
+# Top topic result
+top_docs_num <- lda_fit$document_sums %>% top.topic.documents(5)
+top_words_df <- lda_fit$topics %>% 
+  top.topic.words(num.words = 8, by.score = TRUE) %>% 
+  data.frame() %>% setDT() %>% transpose()
+row.names(top_words_df) <- paste0("topic_", seq(nrow(top_words_df)))
+top_words_df %>% DT::datatable()
+```
+
+### [>> LDAVis](https://leoluyi.github.io/old_people_news/ldavis/)
+
+```{r, eval=FALSE}
+library(LDAvis)
+theta <- apply(lda_fit$document_sums + alpha, 2, 
+               function(x) x/sum(x)) %>% t()
+phi <- apply(t(lda_fit$topics) + eta, 2, 
+             function(x) x/sum(x)) %>% t()
+
+lda_view <- list(phi = phi,
+                 theta = theta,
+                 doc.length = doc.length,
+                 vocab = vocab_,
+                 term.frequency = term.frequency)
+
+# create the JSON object to feed the visualization:
+json <- LDAvis::createJSON(phi = lda_view$phi, 
+                   theta = lda_view$theta, 
+                   doc.length = lda_view$doc.length, 
+                   vocab = lda_view$vocab, 
+                   term.frequency = lda_view$term.frequency)
+serVis(json, out.dir = 'ldavis', open.browser = FALSE)
+```
+
+
